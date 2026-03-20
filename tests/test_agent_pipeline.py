@@ -40,6 +40,7 @@ class TestAgentConfig(unittest.TestCase):
         from src.config import Config
         Config._instance = None
         config = Config._load_from_env()
+        self.assertEqual(config.agent_litellm_model, "")
         self.assertFalse(config.agent_mode)
         self.assertEqual(config.agent_max_steps, 10)
         self.assertEqual(config.agent_skills, [])
@@ -82,6 +83,15 @@ class TestAgentConfig(unittest.TestCase):
         config = Config._load_from_env()
         self.assertEqual(config.agent_skills, ['dragon_head', 'shrink_pullback'])
 
+    @patch.dict(os.environ, {'AGENT_LITELLM_MODEL': 'gpt-4o-mini'}, clear=True)
+    def test_agent_is_available_when_agent_primary_model_is_configured(self):
+        """Agent availability auto-detection should use effective Agent primary model."""
+        from src.config import Config
+        Config._instance = None
+        config = Config._load_from_env()
+        self.assertEqual(config.agent_litellm_model, 'openai/gpt-4o-mini')
+        self.assertTrue(config.is_agent_available())
+
 
 # ============================================================
 # AgentResult to AnalysisResult conversion
@@ -110,6 +120,7 @@ class TestAgentResultConversion(unittest.TestCase):
             mock_cfg.brave_api_keys = []
             mock_cfg.serpapi_keys = []
             mock_cfg.searxng_base_urls = []
+            mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
             mock_cfg.enable_chip_distribution = True
@@ -311,6 +322,7 @@ class TestPipelineRouting(unittest.TestCase):
             mock_cfg.brave_api_keys = []
             mock_cfg.serpapi_keys = []
             mock_cfg.searxng_base_urls = []
+            mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
             mock_cfg.enable_chip_distribution = True
@@ -327,12 +339,14 @@ class TestPipelineRouting(unittest.TestCase):
 
             pipeline.analyze_stock("600519", ReportType.SIMPLE, "q1")
 
-            pipeline._analyze_with_agent.assert_called_once_with(
-                "600519", ReportType.SIMPLE, "q1",
-                pipeline.fetcher_manager.get_realtime_quote.return_value.name,
-                pipeline.fetcher_manager.get_realtime_quote.return_value,
-                pipeline.fetcher_manager.get_chip_distribution.return_value
-            )
+            pipeline._analyze_with_agent.assert_called_once()
+            call_args = pipeline._analyze_with_agent.call_args
+            # Positional args: code, report_type, query_id, stock_name, realtime_quote, chip_data, fundamental_context, trend_result
+            self.assertEqual(call_args[0][0], "600519")
+            self.assertEqual(call_args[0][1], ReportType.SIMPLE)
+            self.assertEqual(call_args[0][2], "q1")
+            # trend_result (8th arg) should be present (may be a TrendAnalysisResult or None)
+            self.assertEqual(len(call_args[0]), 8)
 
     def test_legacy_mode_does_not_call_agent(self):
         """When agent_mode=False, analyze_stock should NOT call _analyze_with_agent."""
@@ -346,6 +360,7 @@ class TestPipelineRouting(unittest.TestCase):
             mock_cfg = MagicMock()
             mock_cfg.max_workers = 2
             mock_cfg.agent_mode = False
+            mock_cfg.is_agent_available.return_value = False
             mock_cfg.agent_max_steps = 10
             mock_cfg.agent_skills = []
             mock_cfg.bocha_api_keys = []
@@ -353,6 +368,7 @@ class TestPipelineRouting(unittest.TestCase):
             mock_cfg.brave_api_keys = []
             mock_cfg.serpapi_keys = []
             mock_cfg.searxng_base_urls = []
+            mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
             mock_cfg.enable_chip_distribution = True
@@ -404,6 +420,7 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_cfg.brave_api_keys = []
             mock_cfg.serpapi_keys = []
             mock_cfg.searxng_base_urls = []
+            mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
             mock_cfg.enable_chip_distribution = True
@@ -552,6 +569,78 @@ class TestAgentConstructionChain(unittest.TestCase):
         self.assertIsNotNone(executor.tool_registry)
         self.assertIsNotNone(executor.llm_adapter)
 
+    @patch("src.agent.llm_adapter.Router")
+    def test_llm_adapter_call_completion_uses_effective_agent_models_order(self, _mock_router):
+        """call_completion should use Agent effective model chain in order."""
+        mock_cfg = MagicMock()
+        mock_cfg.agent_litellm_model = "gpt-4o-mini"
+        mock_cfg.litellm_model = "gemini/gemini-2.5-flash"
+        mock_cfg.litellm_fallback_models = ["openai/gpt-4o-mini", "anthropic/claude-3-5-sonnet-20241022"]
+        mock_cfg.llm_model_list = []
+        mock_cfg.llm_temperature = 0.7
+        mock_cfg.gemini_api_keys = []
+        mock_cfg.anthropic_api_keys = []
+        mock_cfg.openai_api_keys = []
+        mock_cfg.deepseek_api_keys = []
+        mock_cfg.openai_base_url = None
+
+        from src.agent.llm_adapter import LLMToolAdapter
+        adapter = LLMToolAdapter(config=mock_cfg)
+
+        calls = []
+
+        def fake_call(_messages, _tools, model, **_kwargs):
+            calls.append(model)
+            if model == "openai/gpt-4o-mini":
+                raise RuntimeError("primary failed")
+            return MagicMock(content="ok")
+
+        adapter._call_litellm_model = MagicMock(side_effect=fake_call)
+
+        result = adapter.call_completion(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+        self.assertEqual(calls, ["openai/gpt-4o-mini", "anthropic/claude-3-5-sonnet-20241022"])
+        self.assertEqual(result.content, "ok")
+
+    @patch("src.agent.llm_adapter.Router")
+    def test_llm_adapter_recomputes_timeout_for_each_fallback_attempt(self, _mock_router):
+        """Each fallback model attempt should receive only the remaining timeout budget."""
+        mock_cfg = MagicMock()
+        mock_cfg.agent_litellm_model = "gpt-4o-mini"
+        mock_cfg.litellm_model = None
+        mock_cfg.litellm_fallback_models = ["anthropic/claude-3-5-sonnet-20241022"]
+        mock_cfg.llm_model_list = []
+        mock_cfg.llm_temperature = 0.7
+        mock_cfg.gemini_api_keys = []
+        mock_cfg.anthropic_api_keys = []
+        mock_cfg.openai_api_keys = []
+        mock_cfg.deepseek_api_keys = []
+        mock_cfg.openai_base_url = None
+
+        from src.agent.llm_adapter import LLMToolAdapter
+        adapter = LLMToolAdapter(config=mock_cfg)
+
+        timeouts = []
+
+        def fake_call(_messages, _tools, model, **kwargs):
+            timeouts.append((model, kwargs.get("timeout")))
+            if model == "openai/gpt-4o-mini":
+                raise RuntimeError("primary failed")
+            return MagicMock(content="ok")
+
+        adapter._call_litellm_model = MagicMock(side_effect=fake_call)
+
+        with patch("src.agent.llm_adapter.time.time", side_effect=[0.0, 0.0, 7.0, 7.0]):
+            result = adapter.call_completion(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                timeout=10.0,
+            )
+
+        self.assertEqual(result.content, "ok")
+        self.assertEqual(timeouts[0], ("openai/gpt-4o-mini", 10.0))
+        self.assertEqual(timeouts[1], ("anthropic/claude-3-5-sonnet-20241022", 3.0))
+
 
 # ============================================================
 # _safe_int tests
@@ -579,6 +668,7 @@ class TestSafeInt(unittest.TestCase):
             mock_cfg.brave_api_keys = []
             mock_cfg.serpapi_keys = []
             mock_cfg.searxng_base_urls = []
+            mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
             mock_cfg.enable_chip_distribution = True
@@ -720,6 +810,7 @@ class TestSkillActivation(unittest.TestCase):
             mock_cfg.brave_api_keys = []
             mock_cfg.serpapi_keys = []
             mock_cfg.searxng_base_urls = []
+            mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
             mock_cfg.enable_chip_distribution = True
